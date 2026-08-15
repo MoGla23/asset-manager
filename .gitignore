@@ -1,0 +1,12 @@
+# Virtuelle Umgebung
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Lokale Datenbank (private Depot-Daten, gehören nicht ins Repository)
+data/
+
+# macOS
+.DS_Store
