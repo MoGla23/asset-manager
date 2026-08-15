@@ -26,6 +26,7 @@ from prices import (
     get_current_price,
     get_exchange_rate_history,
     get_exchange_rate_to_eur,
+    get_fundamentals,
     get_price_history,
     get_ticker_currency,
     wert_am_oder_vor_datum,
@@ -56,6 +57,10 @@ BENCHMARK_OPTIONEN = {
     "MSCI World (URTH)": "URTH",
     "DAX": "^GDAXI",
 }
+
+# Referenzindex für die Beta-Berechnung im Analyse-Tab.
+BETA_REFERENZ_TICKER = "^GSPC"
+BETA_REFERENZ_LABEL = "S&P 500"
 
 
 @st.dialog("Transaktion wirklich löschen?")
@@ -90,6 +95,15 @@ def fetch_currencies(tickers):
     eine Stunde lang gecacht statt nur eine Minute wie bei den Kursen.
     """
     return {ticker: get_ticker_currency(ticker) for ticker in tickers}
+
+
+@st.cache_data(ttl=3600, show_spinner="Fundamentaldaten werden abgerufen...")
+def fetch_fundamentals(tickers):
+    """Ruft für mehrere Ticker Fundamentaldaten ab (KGV, Dividendenrendite, Marktkap.).
+
+    Ändert sich selten (Quartalszahlen), daher eine Stunde lang gecacht.
+    """
+    return {ticker: get_fundamentals(ticker) for ticker in tickers}
 
 
 @st.cache_data(ttl=60, show_spinner="Wechselkurse werden abgerufen...")
@@ -378,9 +392,99 @@ def berechne_risikokennzahlen(depotwert_reihe, risikofreier_zins=RISIKOFREIER_ZI
     }
 
 
+def berechne_beta(ticker_renditen, index_renditen):
+    """Berechnet Beta (Kovarianz mit dem Index / Varianz des Index) aus Tagesrenditen.
+
+    Beta > 1 heißt: schwankt stärker als der Referenzindex, < 1 heißt: schwächer.
+    Gibt None zurück, wenn zu wenige gemeinsame Handelstage vorliegen oder der
+    Index in diesem Zeitraum keine Schwankung zeigt (Division durch 0).
+    """
+    if index_renditen is None:
+        return None
+    gemeinsam = pd.concat(
+        [ticker_renditen.rename("ticker"), index_renditen.rename("index")], axis=1, join="inner"
+    ).dropna()
+    if len(gemeinsam) < MIN_DATENPUNKTE_RISIKO:
+        return None
+    varianz_index = gemeinsam["index"].var()
+    if not varianz_index:
+        return None
+    return gemeinsam["ticker"].cov(gemeinsam["index"]) / varianz_index
+
+
+def berechne_ticker_vergleich(tickers, period):
+    """Vergleicht mehrere Ticker unabhängig vom Depot (jeweils auf 100 normiert).
+
+    Anders als beim Depot-Wertverlauf wird hier NICHT in Euro umgerechnet:
+    für den reinen prozentualen Vergleich ist die Handelswährung unerheblich,
+    da jeder Ticker gegen seinen eigenen Startwert normiert wird.
+
+    Gibt (diagramm_df, kennzahlen, fehlgeschlagene_ticker) zurück. diagramm_df
+    hat die Spalte "Datum" plus eine Spalte je erfolgreich geladenem Ticker.
+    kennzahlen ist eine Liste von Dicts mit allen aus dem Kursverlauf selbst
+    berechenbaren Kennzahlen (Gesamtrendite, Volatilität, Max Drawdown, beste/
+    schlechteste Tagesrendite, Beta) für die Kennzahlen-Tabelle.
+    """
+    alle_ticker = tuple(dict.fromkeys(list(tickers) + [BETA_REFERENZ_TICKER]))
+    kurshistorien = fetch_price_histories(alle_ticker, period)
+
+    index_kurse = kurshistorien.get(BETA_REFERENZ_TICKER)
+    index_renditen = (
+        index_kurse.pct_change().dropna()
+        if index_kurse is not None and not index_kurse.empty
+        else None
+    )
+
+    diagramm_df = None
+    kennzahlen = []
+    fehlgeschlagene_ticker = []
+
+    for ticker in tickers:
+        kurse = kurshistorien.get(ticker)
+        if kurse is None or kurse.empty:
+            fehlgeschlagene_ticker.append(ticker)
+            continue
+
+        normiert = kurse / kurse.iloc[0] * 100
+        spalte = pd.DataFrame({"Datum": normiert.index, ticker: normiert.values})
+        if diagramm_df is None:
+            diagramm_df = spalte
+        else:
+            diagramm_df = diagramm_df.merge(spalte, on="Datum", how="outer")
+
+        risiko = berechne_risikokennzahlen(normiert)
+        tagesrenditen = normiert.pct_change().dropna()
+        beta = (
+            None
+            if ticker == BETA_REFERENZ_TICKER
+            else berechne_beta(tagesrenditen, index_renditen)
+        )
+
+        kennzahlen.append(
+            {
+                "Ticker": ticker,
+                "Gesamtrendite (%)": normiert.iloc[-1] - 100,
+                "Volatilität (%)": risiko["volatilitaet"],
+                "Max Drawdown (%)": risiko["max_drawdown"],
+                "Beste Tagesrendite (%)": (
+                    tagesrenditen.max() * 100 if not tagesrenditen.empty else None
+                ),
+                "Schlechteste Tagesrendite (%)": (
+                    tagesrenditen.min() * 100 if not tagesrenditen.empty else None
+                ),
+                f"Beta (vs. {BETA_REFERENZ_LABEL})": beta,
+            }
+        )
+
+    if diagramm_df is not None:
+        diagramm_df = diagramm_df.sort_values("Datum")
+
+    return diagramm_df, kennzahlen, fehlgeschlagene_ticker
+
+
 st.title("Mein Asset Manager")
 
-tab_depot, tab_news = st.tabs(["Mein Depot", "News"])
+tab_depot, tab_analyse, tab_news = st.tabs(["Mein Depot", "Analyse", "News"])
 
 with tab_depot:
     st.header("Depot-Positionen")
@@ -767,6 +871,234 @@ with tab_depot:
         ]
         if st.button("Transaktion löschen"):
             confirm_delete_transaction(loesch_id, loesch_ticker, loesch_typ)
+
+with tab_analyse:
+    st.header("Analyse")
+    st.warning(
+        "Diese Analyse zeigt ausschließlich die **Vergangenheit** und ist "
+        "keine Prognose oder Kaufempfehlung. Vergangene Wertentwicklung ist "
+        "kein verlässlicher Indikator für zukünftige Ergebnisse."
+    )
+    st.write(
+        "Vergleiche 2 bis 5 beliebige Wertpapiere unabhängig von deinem Depot "
+        "- z.B. um vor einem Kauf verschiedene Aktien, ETFs oder Anleihen-ETFs "
+        "gegenüberzustellen."
+    )
+
+    if "analyse_ticker_liste" not in st.session_state:
+        st.session_state["analyse_ticker_liste"] = []
+    if "analyse_ticker_input" not in st.session_state:
+        st.session_state["analyse_ticker_input"] = ""
+
+    st.subheader("Ticker auswählen")
+
+    ausgewaehlter_analyse_ticker = st_searchbox(
+        search_tickers,
+        placeholder="Ticker suchen (z.B. SAP, Apple, MSCI World)...",
+        label="Ticker suchen",
+        key="analyse_searchbox",
+    )
+    if ausgewaehlter_analyse_ticker:
+        st.session_state["analyse_ticker_input"] = ausgewaehlter_analyse_ticker
+
+    # clear_on_submit statt manuellem Zurücksetzen: st.session_state eines
+    # Widgets darf nach dessen Erzeugung im selben Lauf nicht mehr verändert
+    # werden. Innerhalb eines Formulars räumt clear_on_submit das Feld nach
+    # dem Absenden automatisch selbst leer.
+    with st.form("analyse_add_form", clear_on_submit=True):
+        neuer_analyse_ticker = st.text_input(
+            "Ticker (aus der Suche oben oder von Hand)",
+            key="analyse_ticker_input",
+        )
+        analyse_hinzufuegen_geklickt = st.form_submit_button("Hinzufügen")
+
+    if analyse_hinzufuegen_geklickt:
+        ticker_normalisiert = neuer_analyse_ticker.strip().upper()
+        aktuelle_liste = st.session_state["analyse_ticker_liste"]
+        if not ticker_normalisiert:
+            st.error("Bitte einen Ticker eingeben oder aus der Suche auswählen.")
+        elif ticker_normalisiert in aktuelle_liste:
+            st.warning(f"{ticker_normalisiert} ist bereits in der Auswahl.")
+        elif len(aktuelle_liste) >= 5:
+            st.warning(
+                "Maximal 5 Ticker möglich. Entferne erst einen, um einen neuen "
+                "hinzuzufügen."
+            )
+        else:
+            st.session_state["analyse_ticker_liste"] = aktuelle_liste + [ticker_normalisiert]
+            st.rerun()
+
+    aktuelle_analyse_liste = st.session_state["analyse_ticker_liste"]
+    if aktuelle_analyse_liste:
+        analyse_auswahl = st.multiselect(
+            "Ausgewählte Ticker (zum Entfernen abwählen)",
+            options=aktuelle_analyse_liste,
+            default=aktuelle_analyse_liste,
+        )
+        if analyse_auswahl != aktuelle_analyse_liste:
+            st.session_state["analyse_ticker_liste"] = analyse_auswahl
+            st.rerun()
+
+    zeitraum_optionen_analyse = {
+        "1 Monat": "1mo",
+        "6 Monate": "6mo",
+        "1 Jahr": "1y",
+        "5 Jahre": "5y",
+    }
+    ausgewaehlter_zeitraum_analyse = st.selectbox(
+        "Zeitraum", list(zeitraum_optionen_analyse.keys()), index=2, key="analyse_zeitraum"
+    )
+
+    aktuelle_analyse_liste = st.session_state["analyse_ticker_liste"]
+    if len(aktuelle_analyse_liste) < 2:
+        st.info("Wähle mindestens 2 Ticker aus, um sie zu vergleichen.")
+    else:
+        zeitraum_code_analyse = zeitraum_optionen_analyse[ausgewaehlter_zeitraum_analyse]
+        diagramm_df, kennzahlen, fehlgeschlagene_ticker = berechne_ticker_vergleich(
+            aktuelle_analyse_liste, zeitraum_code_analyse
+        )
+
+        if fehlgeschlagene_ticker:
+            st.warning(
+                "Für folgende Ticker konnte keine Kurshistorie abgerufen werden, "
+                f"sie fehlen im Vergleich: {', '.join(fehlgeschlagene_ticker)}"
+            )
+
+        waehrungen_analyse = fetch_currencies(tuple(aktuelle_analyse_liste))
+        unterschiedliche_waehrungen = {c for c in waehrungen_analyse.values() if c is not None}
+        if len(unterschiedliche_waehrungen) > 1:
+            st.caption(
+                "Hinweis: Die ausgewählten Ticker handeln in unterschiedlichen "
+                f"Währungen ({', '.join(sorted(unterschiedliche_waehrungen))}). Für "
+                "den Vergleich spielt das keine Rolle, da jeder Ticker auf seinen "
+                "eigenen Startwert (100) normiert wird - verglichen wird die "
+                "prozentuale Veränderung, nicht der absolute Kurs."
+            )
+
+        if diagramm_df is not None and len(diagramm_df.columns) > 1:
+            fig_vergleich = px.line(
+                diagramm_df,
+                x="Datum",
+                y=[spalte for spalte in diagramm_df.columns if spalte != "Datum"],
+                color_discrete_sequence=KATEGORIE_FARBEN,
+            )
+            fig_vergleich.update_yaxes(title="Indexiert (Start = 100)")
+            fig_vergleich.update_layout(legend_title_text="")
+            st.plotly_chart(fig_vergleich, use_container_width=True)
+
+            st.subheader("Kennzahlen")
+
+            # Anzeigename -> Standardmäßig aktiv? Reihenfolge bestimmt die Spaltenreihenfolge.
+            kursverlauf_optionen = {
+                "Gesamtrendite (%)": True,
+                "Volatilität (%)": True,
+                "Max Drawdown (%)": True,
+                "Beste Tagesrendite (%)": False,
+                "Schlechteste Tagesrendite (%)": False,
+                f"Beta (vs. {BETA_REFERENZ_LABEL})": False,
+            }
+            fundamental_optionen = {
+                "KGV": False,
+                "Dividendenrendite (%)": False,
+                "Marktkapitalisierung": False,
+            }
+
+            with st.expander("Kennzahlen auswählen"):
+                st.caption("Aus dem Kursverlauf (selbst berechnet)")
+                spalten_kv = st.columns(3)
+                sichtbare_kursverlauf = []
+                for i, (name, standard) in enumerate(kursverlauf_optionen.items()):
+                    with spalten_kv[i % 3]:
+                        if st.checkbox(name, value=standard, key=f"analyse_kz_{name}"):
+                            sichtbare_kursverlauf.append(name)
+
+                st.caption("Fundamentaldaten (von yfinance, weniger zuverlässig)")
+                spalten_fd = st.columns(3)
+                sichtbare_fundamental = []
+                for i, (name, standard) in enumerate(fundamental_optionen.items()):
+                    with spalten_fd[i % 3]:
+                        if st.checkbox(name, value=standard, key=f"analyse_kz_{name}"):
+                            sichtbare_fundamental.append(name)
+
+            def formatiere_prozent(wert):
+                return "-" if wert is None or pd.isna(wert) else f"{wert:.2f} %"
+
+            def formatiere_zahl(wert, nachkomma=2):
+                return "-" if wert is None or pd.isna(wert) else f"{wert:.{nachkomma}f}"
+
+            if sichtbare_kursverlauf:
+                prozent_spalten = {
+                    "Gesamtrendite (%)",
+                    "Volatilität (%)",
+                    "Beste Tagesrendite (%)",
+                    "Schlechteste Tagesrendite (%)",
+                    "Max Drawdown (%)",
+                }
+                kennzahlen_anzeige = []
+                for zeile in kennzahlen:
+                    neue_zeile = {"Ticker": zeile["Ticker"]}
+                    for spalte in sichtbare_kursverlauf:
+                        wert = zeile.get(spalte)
+                        neue_zeile[spalte] = (
+                            formatiere_prozent(wert)
+                            if spalte in prozent_spalten
+                            else formatiere_zahl(wert)
+                        )
+                    kennzahlen_anzeige.append(neue_zeile)
+
+                st.dataframe(
+                    pd.DataFrame(kennzahlen_anzeige),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                st.caption(
+                    "Gesamtrendite, Volatilität, Max Drawdown, beste/schlechteste "
+                    "Tagesrendite und Beta werden ausschließlich aus den "
+                    "historischen Kursen des gewählten Zeitraums berechnet (Beta "
+                    f"gegenüber dem {BETA_REFERENZ_LABEL}), mit derselben Logik wie "
+                    "die Depot-Risikokennzahlen. Bei zu kurzer Historie steht "
+                    "\"-\" statt einer unsicheren Zahl."
+                )
+            else:
+                st.info("Wähle oben mindestens eine Kursverlauf-Kennzahl aus.")
+
+            if sichtbare_fundamental:
+                fundamentaldaten = fetch_fundamentals(tuple(aktuelle_analyse_liste))
+                fundamental_anzeige = []
+                for ticker in aktuelle_analyse_liste:
+                    if ticker in fehlgeschlagene_ticker:
+                        continue
+                    daten = fundamentaldaten.get(ticker, {})
+                    zeile = {"Ticker": ticker}
+                    if "KGV" in sichtbare_fundamental:
+                        zeile["KGV"] = formatiere_zahl(daten.get("kgv"))
+                    if "Dividendenrendite (%)" in sichtbare_fundamental:
+                        zeile["Dividendenrendite (%)"] = formatiere_prozent(
+                            daten.get("dividendenrendite")
+                        )
+                    if "Marktkapitalisierung" in sichtbare_fundamental:
+                        marktkap = daten.get("marktkapitalisierung")
+                        zeile["Marktkapitalisierung"] = (
+                            "-" if marktkap is None else f"{marktkap / 1e9:,.1f} Mrd."
+                        )
+                    fundamental_anzeige.append(zeile)
+
+                st.markdown("**Fundamentaldaten** _(Quelle: yfinance)_")
+                st.dataframe(
+                    pd.DataFrame(fundamental_anzeige),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                st.caption(
+                    "Fundamentaldaten stammen direkt von Yahoo Finance und sind "
+                    "weniger verlässlich als die selbst berechneten Kursverlauf-"
+                    "Kennzahlen oben: sie können je nach Datenlage veraltet oder "
+                    "ungenau sein und fehlen bei ETFs/Anleihen-ETFs oft komplett "
+                    "(dann steht \"-\"). Die Marktkapitalisierung ist in der "
+                    "jeweiligen Handelswährung des Tickers angegeben, nicht in Euro."
+                )
+        else:
+            st.info("Für den Vergleich fehlen noch historische Kurse.")
 
 with tab_news:
     st.header("Finanznachrichten")

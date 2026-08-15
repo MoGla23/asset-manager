@@ -29,6 +29,26 @@ def get_ticker_currency(ticker):
         return None
 
 
+def get_fundamentals(ticker):
+    """Gibt ausgewählte Fundamentaldaten eines Tickers zurück (KGV, Dividendenrendite,
+    Marktkapitalisierung), oder None je Feld, wenn es nicht verfügbar ist.
+
+    Solche Daten fehlen z.B. bei ETFs oder Anleihen-ETFs häufig komplett oder
+    teilweise - das ist normal und kein Fehler. Schlägt der gesamte Abruf fehl
+    (z.B. kein Internet), sind einfach alle Felder None statt eines Absturzes.
+    """
+    try:
+        info = yf.Ticker(ticker).get_info()
+    except Exception:
+        info = {}
+
+    return {
+        "kgv": info.get("trailingPE"),
+        "dividendenrendite": info.get("dividendYield"),
+        "marktkapitalisierung": info.get("marketCap"),
+    }
+
+
 def get_exchange_rate_to_eur(currency):
     """Gibt den Wechselkurs von 1 Einheit `currency` in Euro zurück, oder None bei Fehler.
 
